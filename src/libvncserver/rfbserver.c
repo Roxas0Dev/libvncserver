@@ -2323,6 +2323,9 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
             return;
         }
 
+        /* The output thread must not see the pixel format and translation
+           tables change in the middle of a framebuffer update. */
+        LOCK(cl->sendMutex);
         cl->format.bitsPerPixel = msg.spf.format.bitsPerPixel;
         cl->format.depth = msg.spf.format.depth;
         cl->format.bigEndian = (msg.spf.format.bigEndian ? TRUE : FALSE);
@@ -2336,6 +2339,7 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
 
 	cl->readyForSetColourMapEntries = TRUE;
         cl->screen->setTranslateFunction(cl);
+        UNLOCK(cl->sendMutex);
 
         rfbStatRecordMessageRcvd(cl, msg.type, sz_rfbSetPixelFormatMsg, sz_rfbSetPixelFormatMsg);
 
@@ -2367,6 +2371,8 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
      */
     case rfbSetEncodings:
     {
+        uint32_t *encodings = NULL;
+        rfbBool sendXvpInit = FALSE;
 
         if ((n = rfbReadExact(cl, ((char *)&msg) + 1,
                            sz_rfbSetEncodingsMsg - 1)) <= 0) {
@@ -2379,6 +2385,28 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
         msg.se.nEncodings = Swap16IfLE(msg.se.nEncodings);
 
         rfbStatRecordMessageRcvd(cl, msg.type, sz_rfbSetEncodingsMsg+(msg.se.nEncodings*4),sz_rfbSetEncodingsMsg+(msg.se.nEncodings*4));
+
+        /* Read the whole list first, sendMutex must not be held while blocking on the socket. */
+        if (msg.se.nEncodings > 0) {
+            encodings = (uint32_t *)malloc((size_t)msg.se.nEncodings * 4);
+            if (encodings == NULL) {
+                rfbLogPerror("rfbProcessClientNormalMessage: not enough memory");
+                rfbCloseClient(cl);
+                return;
+            }
+            if ((n = rfbReadExact(cl, (char *)encodings, msg.se.nEncodings * 4)) <= 0) {
+                if (n != 0)
+                    rfbLogPerror("rfbProcessClientNormalMessage: read");
+                free(encodings);
+                rfbCloseClient(cl);
+                return;
+            }
+        }
+
+        /* The output thread must not see the encoding settings change in the middle
+           of a framebuffer update, and the ExtendedClipboard capabilities sent below
+           must not be interleaved with one. */
+        LOCK(cl->sendMutex);
 
         /*
          * UltraVNC Client has the ability to adapt to changing network environments
@@ -2412,12 +2440,7 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
 
 
         for (i = 0; i < msg.se.nEncodings; i++) {
-            if ((n = rfbReadExact(cl, (char *)&enc, 4)) <= 0) {
-                if (n != 0)
-                    rfbLogPerror("rfbProcessClientNormalMessage: read");
-                rfbCloseClient(cl);
-                return;
-            }
+            enc = encodings[i];
             enc = Swap32IfLE(enc);
 
             switch (enc) {
@@ -2532,10 +2555,8 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
                 if (cl->screen->xvpHook) {
                   rfbLog("Enabling Xvp protocol extension for client "
                           "%s\n", cl->host);
-                  if (!rfbSendXvp(cl, 1, rfbXvp_Init)) {
-                    rfbCloseClient(cl);
-                    return;
-                  }
+                  /* sent once sendMutex is released, rfbSendXvp() takes it itself */
+                  sendXvpInit = TRUE;
                 }
                 break;
 #ifdef LIBVNCSERVER_HAVE_LIBZ
@@ -2548,6 +2569,8 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
                     }
                     /* send the capabilities we support, currently only text */
                     if (!rfbSendExtendedClipboardCapability(cl)) {
+                        UNLOCK(cl->sendMutex);
+                        free(encodings);
                         return;
                     }
                 }
@@ -2663,6 +2686,14 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
 		 cl->host);
 	  cl->enableCursorPosUpdates = FALSE;
 	}
+
+        UNLOCK(cl->sendMutex);
+        free(encodings);
+
+        if (sendXvpInit && !rfbSendXvp(cl, 1, rfbXvp_Init)) {
+            rfbCloseClient(cl);
+            return;
+        }
 
         return;
     }
@@ -2981,21 +3012,29 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
             free(str);
             return;
         } else if (extClipboardFlags & rfbExtendedClipboard_Request) {
+            /* like rfbSendServerCutTextUTF8(), which also changes extClipboardData,
+               don't interleave with a framebuffer update */
+            LOCK(cl->sendMutex);
             if ((cl->extClipboardUserCap & rfbExtendedClipboard_Provide) &&
                 cl->extClipboardData != NULL && cl->extClipboardDataSize > 0) {
                 if (!rfbSendExtendedServerCutTextData(cl, cl->extClipboardData, cl->extClipboardDataSize)) {
+                    UNLOCK(cl->sendMutex);
                     free(str);
                     return;
                 }
             }
+            UNLOCK(cl->sendMutex);
         } else if (extClipboardFlags & rfbExtendedClipboard_Peek) {
+            LOCK(cl->sendMutex);
             if ((cl->extClipboardUserCap & rfbExtendedClipboard_Notify) &&
                 cl->extClipboardData != NULL && cl->extClipboardDataSize > 0) {
                 if (!rfbSendExtendedClipboardNotify(cl)) {
+                    UNLOCK(cl->sendMutex);
                     free(str);
                     return;
                 }
             }
+            UNLOCK(cl->sendMutex);
         } else if (extClipboardFlags & rfbExtendedClipboard_Provide) {
             if (!rfbProcessExtendedServerCutTextData(cl, extClipboardFlags, str + 4, msg.cct.length - 4)) {
                 free(str);
